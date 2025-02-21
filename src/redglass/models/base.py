@@ -1,9 +1,12 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import torch as t
+
 
 @dataclass
-class ModelConfig: ...
+class ModelConfig:
+    dtype: t.dtype = t.bfloat16
 
 
 class BaseModel(ABC):

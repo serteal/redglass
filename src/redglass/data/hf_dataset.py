@@ -13,3 +13,8 @@ class HuggingFaceDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> Tuple[str, str]:
         return self.data[idx][self.prompt_key], self.data[idx][self.target_key]
+
+
+class AdvBenchDataset(HuggingFaceDataset):
+    def __init__(self):
+        super().__init__("walledai/AdvBench", "train", "prompt", "target")

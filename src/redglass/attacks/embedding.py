@@ -1,117 +1,177 @@
-from typing import Callable, Optional
+from typing import List, Optional, Tuple
 
+import numpy as np
 import torch as t
 from loguru import logger
 from tqdm.autonotebook import tqdm
 
-from redglass.data import BaseDataset
-from redglass.losses import BaseLoss
+import wandb
 from redglass.models import HuggingFaceModel
 
-from .base import AttackConfig, BaseAttack
+from .base import AttackConfig, AttackResult, BaseAttack
 
 
 class EmbeddingAttack(BaseAttack):
     def __init__(
         self,
         model: HuggingFaceModel,
-        loss_fn: Optional[BaseLoss] = None,
         config: Optional[AttackConfig] = None,
     ):
         if config is None:
             config = AttackConfig()
-        super().__init__(model, config, loss_fn)
+        super().__init__(model, config)
 
-    def run(self, dataset: BaseDataset):
-        results = []
-        for input, target in dataset:
-            logger.info(f"Input: {input}")
-            logger.info(f"Target: {target}")
-            messages = [{"role": "user", "content": input}]
+    def _prepare_chat_template(self, input: List[str]) -> List[str]:
+        # Convert to standard huggingface chat format
+        messages_list = [[{"role": "user", "content": el}] for el in input]
 
+        # Add optimization token to the last message if not already present
+        for messages in messages_list:
             if not any(["{optim_str}" in d["content"] for d in messages]):
-                messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
-
-            template = self.model.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-
-            # Remove the BOS token -- this will get added when tokenizing, if necessary
-            if self.model.tokenizer.bos_token and template.startswith(
-                self.model.tokenizer.bos_token
-            ):
-                template = template.replace(self.model.tokenizer.bos_token, "")
-            before_str, after_str = template.split("{optim_str}")
-
-            # Tokenize everything that doesn't get optimized
-            before_ids = self.model.tokenizer([before_str], padding=False)["input_ids"]
-            after_ids = self.model.tokenizer([after_str], add_special_tokens=False)["input_ids"]
-            target_ids = self.model.tokenizer([target], add_special_tokens=False)["input_ids"]
-
-            before_ids, after_ids, target_ids = [
-                t.tensor(ids, device=self.model.device)
-                for ids in (before_ids, after_ids, target_ids)
-            ]
-
-            # Embed everything that doesn't get optimized
-            embedding_layer = self.model.model.get_input_embeddings()
-            before_embeds, after_embeds, target_embeds = [
-                embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)
-            ]
-
-            # Compute the KV Cache for tokens that appear before the optimized tokens
-            with t.no_grad():
-                output = self.model.forward(before_embeds, use_cache=True)
-                prefix_cache = output.past_key_values
-
-            optim_ids = self.model.tokenizer(
-                self.config.optim_str_init, return_tensors="pt", add_special_tokens=False
-            )["input_ids"].to(self.model.device)
-            optim_embeds = embedding_layer(optim_ids).detach().clone().requires_grad_()
-
-            optimizer = t.optim.Adam([optim_embeds], lr=self.config.lr)
-
-            losses = []
-            for i in tqdm(range(self.config.max_steps)):
-                optimizer.zero_grad()
-                input_embeds = t.cat(
-                    [optim_embeds, after_embeds.detach(), target_embeds.detach()], dim=1
+                messages[-1]["content"] = messages[-1]["content"] + self.model.optim_token
+            else:
+                messages[-1]["content"] = messages[-1]["content"].replace(
+                    "{optim_str}", self.model.optim_token
                 )
 
-                output = self.model.forward(
-                    input_embeds,
-                    past_key_values=prefix_cache,
-                    output_hidden_states=True,
+        template = self.model.tokenizer.apply_chat_template(
+            messages_list, tokenize=False, add_generation_prompt=True
+        )
+        return template
+
+    def _tokenize_inputs(self, input: List[str], target: List[str]) -> t.Tensor:
+        tokenizer_kwargs = {
+            "padding": True,
+            "return_tensors": "pt",
+            "return_attention_mask": True,
+            "truncation": True,
+            "max_length": 10000,
+        }
+        input_tokens = self.model.tokenizer(
+            input,
+            padding_side="left",
+            **tokenizer_kwargs,
+        )
+        target_tokens = self.model.tokenizer(
+            target,
+            padding_side="right",
+            **tokenizer_kwargs,
+        )
+
+        return input_tokens, target_tokens
+
+    def _split_inputs_on_optim_token(
+        self, input_tokens: t.Tensor
+    ) -> Tuple[t.Tensor, t.Tensor, t.Tensor, t.Tensor]:
+        optim_positions = (input_tokens.input_ids == self.model.optim_token_id).nonzero()
+
+        # Split into before and after based on optim token position
+        before_ids = input_tokens.input_ids[:, : optim_positions[0, 1]].to(self.model.device)
+        after_ids = input_tokens.input_ids[:, optim_positions[0, 1] + 1 :].to(self.model.device)
+        before_mask = input_tokens.attention_mask[:, : optim_positions[0, 1]].to(self.model.device)
+        after_mask = input_tokens.attention_mask[:, optim_positions[0, 1] + 1 :].to(
+            self.model.device
+        )
+
+        return before_ids, after_ids, before_mask, after_mask
+
+    def run(self, dataloader: t.utils.data.DataLoader) -> AttackResult:
+        if self.config.use_wandb:
+            wandb.init(project=self.config.wandb_project, config=self.config)
+
+        embedding_layer = self.model.model.get_input_embeddings()
+
+        optim_ids = self.model.tokenizer(
+            self.config.optim_str_init, return_tensors="pt", add_special_tokens=False
+        )["input_ids"].to(self.model.device)
+        optim_embeds = embedding_layer(optim_ids).detach().clone().requires_grad_()
+
+        optimizer = t.optim.Adam([optim_embeds], lr=self.config.lr)
+
+        losses = []
+        for epoch in range(self.config.epochs):
+            for batch in tqdm(dataloader):
+                input, target = batch
+                batch_size = len(input)
+
+                template = self._prepare_chat_template(input)
+
+                input_tokens, target_tokens = self._tokenize_inputs(template, target)
+
+                before_ids, after_ids, before_mask, after_mask = self._split_inputs_on_optim_token(
+                    input_tokens
                 )
-                logits = output.logits
 
-                # Shift logits so token n-1 predicts token n
-                shift = input_embeds.shape[1] - target_ids.shape[1]
-                shift_logits = logits[
-                    ..., shift - 1 : -1, :
-                ].contiguous()  # (1, num_target_ids, vocab_size)
-                shift_labels = target_ids
+                target_ids = target_tokens.input_ids.to(self.model.device)
+                target_mask = target_tokens.attention_mask.to(self.model.device)
 
-                loss = t.nn.functional.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-                )
-                loss_float = loss.item()
-                losses.append(loss_float)
+                # Embed everything that doesn't get optimized
+                before_embeds = embedding_layer(before_ids)
+                after_embeds = embedding_layer(after_ids)
+                target_embeds = embedding_layer(target_ids)
 
-                if self.config.verbose:
-                    logger.info(f"Iter: {i} Loss: {loss_float}")
+                batch_losses = []
+                for _ in range(self.config.max_steps):
+                    optimizer.zero_grad()
 
-                loss.backward(retain_graph=True)
-                optimizer.step()
+                    input_embeds = t.cat(
+                        [
+                            before_embeds.detach(),
+                            optim_embeds.expand(batch_size, -1, -1),
+                            after_embeds.detach(),
+                            target_embeds.detach(),
+                        ],
+                        dim=1,
+                    )
 
-            results.append(
-                {
-                    "losses": losses,
-                    "optim_embeds": optim_embeds.cpu(),
-                    "input_embeds": t.cat(
-                        [before_embeds, optim_embeds, after_embeds], dim=1
-                    ).cpu(),
-                }
-            )
+                    optim_mask = t.ones(
+                        batch_size,
+                        optim_embeds.shape[1],
+                        device=self.model.device,
+                    )
+                    input_attn_mask = t.cat(
+                        [
+                            before_mask,
+                            optim_mask,
+                            after_mask,
+                            target_mask,
+                        ],
+                        dim=1,
+                    )
 
-        return results
+                    # TODO: Implement KV Cache
+                    output = self.model.forward(
+                        input_embeds,
+                        attention_mask=input_attn_mask,
+                        output_hidden_states=True,
+                    )
+                    logits = output.logits
+
+                    # Shift logits so token n-1 predicts token n
+                    shift = input_embeds.shape[1] - target_ids.shape[1]
+                    shift_logits = logits[
+                        ..., shift - 1 : -1, :
+                    ].contiguous()  # (1, num_target_ids, vocab_size)
+                    shift_labels = target_ids
+
+                    loss = t.nn.functional.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=self.model.tokenizer.pad_token_id,  # Ignore padding tokens
+                    )
+                    batch_losses.append(loss.item())
+
+                    loss.backward()
+                    optimizer.step()
+
+                if self.config.use_wandb:
+                    wandb.log({"embedding_attack/loss": batch_losses[-1]})
+
+                losses.append(batch_losses)
+
+        return AttackResult(
+            losses=losses,
+            best_losses=[],
+            best_outputs=[],
+            suffixes=[],
+        )

@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Logs and other local files
+external/
+wandb/
+logs/

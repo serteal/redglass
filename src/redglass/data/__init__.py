@@ -1,2 +1,2 @@
-from .base import BaseDataset
+from .base import BaseDataset, LocalDataset
 from .hf_dataset import HuggingFaceDataset
