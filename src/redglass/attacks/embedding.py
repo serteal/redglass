@@ -11,7 +11,14 @@ from redglass.models import HuggingFaceModel
 from .base import AttackConfig, AttackResult, BaseAttack
 
 
-class EmbeddingAttack(BaseAttack):
+class IndividualEmbeddingAttack(BaseAttack):
+    """
+    Implements a per-example embedding attack.
+
+    For each example, this attack optimizes an embedding suffix to maximize the log-likelihood of the
+    target sequence given the input sequence.
+    """
+
     def __init__(
         self,
         model: HuggingFaceModel,
@@ -20,6 +27,7 @@ class EmbeddingAttack(BaseAttack):
         if config is None:
             config = AttackConfig()
         super().__init__(model, config)
+        self.embedding_layer = self.model.model.get_input_embeddings()
 
     def _prepare_chat_template(self, input: List[str]) -> List[str]:
         # Convert to standard huggingface chat format
@@ -75,16 +83,130 @@ class EmbeddingAttack(BaseAttack):
 
         return before_ids, after_ids, before_mask, after_mask
 
+    def run_single_example(self, input, target, optim_embeds, optimizer):
+        batch_size = len(input)
+        template = self._prepare_chat_template(input)
+
+        input_tokens, target_tokens = self._tokenize_inputs(template, target)
+
+        before_ids, after_ids, before_mask, after_mask = self._split_inputs_on_optim_token(
+            input_tokens
+        )
+
+        target_ids = target_tokens.input_ids.to(self.model.device)
+        target_mask = target_tokens.attention_mask.to(self.model.device)
+
+        # Embed everything that doesn't get optimized
+        before_embeds = self.embedding_layer(before_ids)
+        after_embeds = self.embedding_layer(after_ids)
+        target_embeds = self.embedding_layer(target_ids)
+
+        batch_losses = []
+        for _ in range(self.config.max_steps):
+            optimizer.zero_grad()
+
+            input_embeds = t.cat(
+                [
+                    before_embeds.detach(),
+                    optim_embeds.expand(batch_size, -1, -1),
+                    after_embeds.detach(),
+                    target_embeds.detach(),
+                ],
+                dim=1,
+            )
+
+            optim_mask = t.ones(
+                batch_size,
+                optim_embeds.shape[1],
+                device=self.model.device,
+            )
+            input_attn_mask = t.cat(
+                [
+                    before_mask,
+                    optim_mask,
+                    after_mask,
+                    target_mask,
+                ],
+                dim=1,
+            )
+
+            # TODO: Implement KV Cache
+            output = self.model.forward(
+                input_embeds,
+                attention_mask=input_attn_mask,
+                output_hidden_states=True,
+            )
+            logits = output.logits
+
+            # Shift logits so token n-1 predicts token n
+            shift = input_embeds.shape[1] - target_ids.shape[1]
+            shift_logits = logits[
+                ..., shift - 1 : -1, :
+            ].contiguous()  # (1, num_target_ids, vocab_size)
+            shift_labels = target_ids
+
+            loss = t.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=self.model.tokenizer.pad_token_id,  # Ignore padding tokens
+            )
+            batch_losses.append(loss.item())
+            loss.backward()
+            optimizer.step()
+
+        return batch_losses
+
     def run(self, dataloader: t.utils.data.DataLoader) -> AttackResult:
         if self.config.use_wandb:
             wandb.init(project=self.config.wandb_project, config=self.config)
 
-        embedding_layer = self.model.model.get_input_embeddings()
+        assert dataloader.batch_size == 1, "Batch size must be 1 for single input attack"
+
+        if self.config.epochs != 1:
+            logger.warning(
+                f"Individual embedding attack uses 1 epoch by default, but {self.config.epochs} epochs were set."
+            )
+
+        losses = []
+        for batch in tqdm(dataloader):
+            optim_ids = self.model.tokenizer(
+                self.config.optim_str_init, return_tensors="pt", add_special_tokens=False
+            )["input_ids"].to(self.model.device)
+            optim_embeds = self.embedding_layer(optim_ids).detach().clone().requires_grad_()
+
+            optimizer = t.optim.Adam([optim_embeds], lr=self.config.lr)
+
+            input, target = batch
+            batch_losses = self.run_single_example(input, target, optim_embeds, optimizer)
+            losses.append(batch_losses)
+
+            if self.config.use_wandb:
+                wandb.log({"embedding_attack/loss": batch_losses[-1]})
+
+        return AttackResult(
+            losses=losses,
+            best_losses=[],
+            best_outputs=[],
+            suffixes=[],
+        )
+
+
+class UniversalEmbeddingAttack(IndividualEmbeddingAttack):
+    """
+    Implements a universal embedding attack.
+
+    This attack optimizes a single embedding suffix to maximize the log-likelihood of the
+    target sequence given the input sequence for all examples in the dataset.
+    """
+
+    def run(self, dataloader: t.utils.data.DataLoader) -> AttackResult:
+        if self.config.use_wandb:
+            wandb.init(project=self.config.wandb_project, config=self.config)
 
         optim_ids = self.model.tokenizer(
             self.config.optim_str_init, return_tensors="pt", add_special_tokens=False
         )["input_ids"].to(self.model.device)
-        optim_embeds = embedding_layer(optim_ids).detach().clone().requires_grad_()
+        optim_embeds = self.embedding_layer(optim_ids).detach().clone().requires_grad_()
 
         optimizer = t.optim.Adam([optim_embeds], lr=self.config.lr)
 
@@ -92,78 +214,7 @@ class EmbeddingAttack(BaseAttack):
         for epoch in range(self.config.epochs):
             for batch in tqdm(dataloader):
                 input, target = batch
-                batch_size = len(input)
-
-                template = self._prepare_chat_template(input)
-
-                input_tokens, target_tokens = self._tokenize_inputs(template, target)
-
-                before_ids, after_ids, before_mask, after_mask = self._split_inputs_on_optim_token(
-                    input_tokens
-                )
-
-                target_ids = target_tokens.input_ids.to(self.model.device)
-                target_mask = target_tokens.attention_mask.to(self.model.device)
-
-                # Embed everything that doesn't get optimized
-                before_embeds = embedding_layer(before_ids)
-                after_embeds = embedding_layer(after_ids)
-                target_embeds = embedding_layer(target_ids)
-
-                batch_losses = []
-                for _ in range(self.config.max_steps):
-                    optimizer.zero_grad()
-
-                    input_embeds = t.cat(
-                        [
-                            before_embeds.detach(),
-                            optim_embeds.expand(batch_size, -1, -1),
-                            after_embeds.detach(),
-                            target_embeds.detach(),
-                        ],
-                        dim=1,
-                    )
-
-                    optim_mask = t.ones(
-                        batch_size,
-                        optim_embeds.shape[1],
-                        device=self.model.device,
-                    )
-                    input_attn_mask = t.cat(
-                        [
-                            before_mask,
-                            optim_mask,
-                            after_mask,
-                            target_mask,
-                        ],
-                        dim=1,
-                    )
-
-                    # TODO: Implement KV Cache
-                    output = self.model.forward(
-                        input_embeds,
-                        attention_mask=input_attn_mask,
-                        output_hidden_states=True,
-                    )
-                    logits = output.logits
-
-                    # Shift logits so token n-1 predicts token n
-                    shift = input_embeds.shape[1] - target_ids.shape[1]
-                    shift_logits = logits[
-                        ..., shift - 1 : -1, :
-                    ].contiguous()  # (1, num_target_ids, vocab_size)
-                    shift_labels = target_ids
-
-                    loss = t.nn.functional.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
-                        ignore_index=self.model.tokenizer.pad_token_id,  # Ignore padding tokens
-                    )
-                    batch_losses.append(loss.item())
-
-                    loss.backward()
-                    optimizer.step()
-
+                batch_losses = self.run_single_example(input, target, optim_embeds, optimizer)
                 if self.config.use_wandb:
                     wandb.log({"embedding_attack/loss": batch_losses[-1]})
 

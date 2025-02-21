@@ -3,6 +3,7 @@ from typing import Optional
 import nanogcg
 import torch as t
 from loguru import logger
+from nanogcg import GCGConfig
 from tqdm.autonotebook import tqdm
 
 from redglass.models.huggingface import HuggingFaceModel

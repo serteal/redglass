@@ -1,5 +1,6 @@
 from .base import AttackConfig, BaseAttack
-from .embedding import EmbeddingAttack
+from .embedding import IndividualEmbeddingAttack, UniversalEmbeddingAttack
+from .flrt import FLRTAttack
 from .gcg import GCGAttack
 
 """
