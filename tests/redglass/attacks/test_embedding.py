@@ -2,8 +2,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from redglass.attacks.base import AttackConfig
-from redglass.attacks.embedding import EmbeddingAttack
+from redglass.attacks import AttackConfig, IndividualEmbeddingAttack
 from redglass.models import HuggingFaceModel
 
 
@@ -25,7 +24,7 @@ def attack_config():
 
 @pytest.fixture
 def embedding_attack(model, attack_config):
-    return EmbeddingAttack(model, attack_config)
+    return IndividualEmbeddingAttack(model, attack_config)
 
 
 MODEL_TEMPLATE = "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n<|im_start|>user\n{message}<|optim-loc|><|im_end|>\n<|im_start|>assistant\n"
@@ -63,7 +62,6 @@ def test_tokenize_inputs(embedding_attack):
 
 
 def test_split_inputs_on_optim_token(embedding_attack):
-    # Create a simple input with the optimization token
     input_text = [f"Hello{embedding_attack.model.optim_token}world"]
     input_tokens = embedding_attack.model.tokenizer(
         input_text,
@@ -84,9 +82,9 @@ def test_split_inputs_on_optim_token(embedding_attack):
 
 @pytest.mark.slow
 def test_run_attack(embedding_attack):
-    # Create a simple test dataset
     inputs = ["What is 2+2?", "What is 3+3?"]
     targets = ["4", "6"]
+
     dataset = list(zip(inputs, targets))
     dataloader = DataLoader(dataset, batch_size=2)
 

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Sequence, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import pandas as pd
 from loguru import logger
@@ -19,9 +19,26 @@ class BaseDataset(Dataset, ABC):
 
 
 class LocalDataset(BaseDataset):
-    def __init__(self, data: pd.DataFrame, prompt_key: str, target_key: str):
-        self.data = data
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        prompt_key: str,
+        target_key: str,
+        idx_start: Optional[int] = None,
+        idx_end: Optional[int] = None,
+    ):
+        self.idx_start = idx_start
+        self.idx_end = idx_end
+        if idx_start is not None and idx_end is not None:
+            self.data = data.iloc[idx_start:idx_end]
+        elif idx_start is not None:
+            self.data = data.iloc[idx_start:]
+        elif idx_end is not None:
+            self.data = data.iloc[:idx_end]
+        else:
+            self.data = data
         logger.info(f"Loaded {len(self.data)} rows")
+
         self.prompt_key = prompt_key
         self.target_key = target_key
 

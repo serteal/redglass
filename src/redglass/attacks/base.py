@@ -11,6 +11,16 @@ from redglass.models import HuggingFaceModel
 
 
 @dataclass
+class FLRTConfig:
+    p_add: float = 0.5
+    p_swap: float = 0.5
+    k1: int = 10
+    k2: int = 10
+    init_len: int = 10
+    buffer_size: int = 100
+
+
+@dataclass
 class AttackConfig:
     epochs: int = 2
     max_steps: int = 10
@@ -23,6 +33,7 @@ class AttackConfig:
     seed: Optional[int] = None
     use_prefix_cache: bool = False
     gcg_config: Optional[GCGConfig] = None
+    flrt_config: Optional[FLRTConfig] = None
 
 
 @dataclass

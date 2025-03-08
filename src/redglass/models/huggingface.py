@@ -24,6 +24,7 @@ class HuggingFaceModel(BaseModel):
                 if t.backends.mps.is_available()
                 else "cuda" if t.cuda.is_available() else "cpu"
             )
+        self.name_or_path = name_or_path
         self.device = device
 
         # Setup model
