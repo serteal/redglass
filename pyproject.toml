@@ -7,9 +7,14 @@ authors = [{ name = "serteal", email = "serteal@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
     "datasets>=3.2.0",
+    "einops>=0.8.1",
     "jaxtyping>=0.2.36",
-    "loguru>=0.7.3",
     "nanogcg>=0.3.0",
+    "peft>=0.14.0",
+    "pydantic>=2.10.5",
+    "rich>=13.9.4",
+    "scikit-learn>=1.6.1",
+    "termcolor>=2.5.0",
     "torch>=2.5.1",
     "transformers>=4.47.1",
     "wandb>=0.19.4",
@@ -29,3 +34,6 @@ dev = [
 
 [tool.pytest.ini_options]
 markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+
+[tool.ruff]
+lint.ignore = ["F722", "E712"] # ignores forward annotation error in jaxtyping
