@@ -6,7 +6,7 @@ a model generate specific target completions.
 # %%
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 
 from transformers import set_seed
 
@@ -21,19 +21,25 @@ set_seed(42)
 model, tokenizer = get_llama3_model_and_tokenizer(model_name="llama-8b")
 
 # %%
-attack = EmbeddingAttack(
-    model=model,  # type: ignore
-    tokenizer=tokenizer,
-    learning_rate=1e-3,
-    num_iterations_per_example=10,
-    num_epochs=1,
-)
-
 # Get training dataset
 train_dataset = CircuitBreakersDataset(variant="plain", shuffle_upon_init=True)
 train_dataset = train_dataset.get_unsafe()  # we only train on unsafe examples
 logger.info(f"Training attack on {len(train_dataset)} examples")
 
-attack.optimize(train_dataset)
+# %%
+attack = EmbeddingAttack(
+    model=model,  # type: ignore
+    tokenizer=tokenizer,
+    universal=True,
+    learning_rate=1e-3,
+    optimization_init="!" * 30,
+    num_iterations_per_example=3,
+    num_epochs=2,
+    use_wandb=False,
+    wandb_project="test-redglass",
+)
+
+
+attack_result = attack.optimize(train_dataset)
 
 # %%

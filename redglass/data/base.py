@@ -534,12 +534,10 @@ class TargetedDialogueDataset:
                 self._slice_by_index(indices_to_keep)
             )
 
-        # If targets are provided, use them; otherwise they'll be loaded from _get_dialogues
-        if target_completions is not None:
-            self.target_completions = target_completions
-            assert len(self.target_completions) == len(self.dialogues), (
-                "Number of target completions must match number of dialogues"
-            )
+        # If targets are provided, use them
+        assert len(self.target_completions) == len(self.dialogues), (
+            "Number of target completions must match number of dialogues"
+        )
 
     def _get_dialogues(
         self,

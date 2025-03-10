@@ -2,16 +2,34 @@
 Embedding-based attacks that optimize tokens to be appended to prompts.
 """
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from redglass.data import DialogueDataset, TargetedDialogueDataset
+import wandb
+from redglass.data import TargetedDialogueDataset
 from redglass.data.tokenized_data import TokenizedDataset
 from redglass.log import logger
 from redglass.types import Dialogue
+from redglass.utils import preprocess_dialogue
+
+
+@dataclass
+class AttackResult:
+    """
+    The result of an attack.
+
+    Args:
+        optimized_embeddings: The optimized embeddings. If the attack is not universal,
+            this will be a list of tensors, one for each example in the dataset.
+        losses: The losses for each example in each epoch
+    """
+
+    optimized_embeddings: torch.Tensor | list[torch.Tensor]
+    losses: list[list[float]]
 
 
 class EmbeddingAttack:
@@ -34,11 +52,14 @@ class EmbeddingAttack:
         self,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
-        optimization_init: str = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+        universal: bool,
+        num_tokens: int = 50,
+        optimization_init: str | None = None,
         learning_rate: float = 0.1,
         num_iterations_per_example: int = 10,
         num_epochs: int = 1,
-        device: Optional[str] = None,
+        use_wandb: bool = False,
+        wandb_project: Optional[str] = None,
     ):
         """
         Initialize the embedding attack.
@@ -46,26 +67,41 @@ class EmbeddingAttack:
         Args:
             model: The model to attack
             tokenizer: The tokenizer for the model
-            num_tokens: Number of optimization tokens to append
+            universal: Whether to use a universal initialization for the embeddings
+            optimization_init: The initial optimization tokens. If None, random
+                initialization is used.
+            num_tokens: Number of optimization tokens to append. If `optimization_init` is
+                not None, this is ignored.
             learning_rate: Learning rate for optimization
-            num_iterations_per_example: Number of optimization iterations per example
-            device: Device to run optimization on (defaults to CUDA if available)
+            num_iterations_per_example: Number of optimization iterations per example in
+                the dataset.
+            num_epochs: Number of epochs to run the optimization for.
+            use_wandb: Whether to use Weights & Biases for logging
+            wandb_project: The name of the Weights & Biases project
         """
         self.model = model
         self.tokenizer = tokenizer
+        self.universal = universal
         self.optimization_init = optimization_init
+        self.num_tokens = num_tokens
         self.learning_rate = learning_rate
         self.num_iterations_per_example = num_iterations_per_example
         self.num_epochs = num_epochs
-        self.device = (
-            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-        )
 
-        self.model = self.model.to(self.device)
+        self.device = self.model.device
+        if self.device == "cpu":
+            logger.warning(
+                "Running optimization on CPU. This may be very slow. GPU is recommended."
+            )
+
+        self.use_wandb = use_wandb
+        self.wandb_project = wandb_project
+
+        self.optim_token = "<|optim-loc|>"
 
     def _prepare_dataset(
         self, dataset: TargetedDialogueDataset
-    ) -> Tuple[TokenizedDataset, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Prepare the dataset for optimization by creating prompt dialogues and tokenizing.
 
@@ -80,20 +116,37 @@ class EmbeddingAttack:
             # Create a copy of the dialogue without the last assistant message
             prompt_dialogue = []
             for msg in dialogue:
-                if msg.role == "assistant" and msg is dialogue[-1]:
+                if msg is dialogue[-1] and msg.role == "assistant":
                     # Skip the last assistant message as this is what we want to generate
                     continue
                 prompt_dialogue.append(msg)
 
+            prompt_dialogue[-1].content += self.optim_token
             prompt_dialogues.append(Dialogue(prompt_dialogue))
 
-        # Tokenize prompts
-        tokenized_prompts = TokenizedDataset.from_dialogue_list(
-            prompt_dialogues,
-            self.tokenizer,
-            detection_mask_padding=dataset.padding,
-            for_generation=True,  # Set to True to prepare for generation
-        )
+        # Preprocess and format prompts
+        processed = [preprocess_dialogue(d) for d in prompt_dialogues]
+        formatted_dialogues: list[str] = self.tokenizer.apply_chat_template(
+            processed, tokenize=False, add_generation_prompt=True
+        )  # type: ignore
+
+        # Tokenize before optimization token
+        before_dialogues = [d.split(self.optim_token)[0] for d in formatted_dialogues]
+        tokenized_before = self.tokenizer(
+            before_dialogues,
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=False,
+            truncation=True,
+        ).to(self.device)
+
+        # Tokenize after optimization token
+        after_dialogues = [d.split(self.optim_token)[1] for d in formatted_dialogues]
+        tokenized_after = self.tokenizer(
+            after_dialogues,
+            return_tensors="pt",
+            add_special_tokens=False,
+        ).to(self.device)
 
         # Tokenize targets
         tokenized_targets = self.tokenizer(
@@ -104,9 +157,76 @@ class EmbeddingAttack:
             add_special_tokens=False,  # not add <begin_of_text>
         ).to(self.device)
 
-        return tokenized_prompts, tokenized_targets
+        return tokenized_before, tokenized_after, tokenized_targets
 
-    def optimize(self, dataset: DialogueDataset) -> dict[int, torch.Tensor]:
+    def _print_input_and_target(
+        self,
+        before_tokens: torch.Tensor,
+        after_tokens: torch.Tensor,
+        target: torch.Tensor,
+    ):
+        """
+        Print the input and target tokens.
+        """
+        print("=" * 100)
+        print(self.tokenizer.decode(before_tokens[0]) + self.optim_token)
+        print("-" * 100)
+        print(self.tokenizer.decode(after_tokens[0]))
+        print("-" * 100)
+        print(self.tokenizer.decode(target[0]))
+        print("=" * 100)
+
+    def _generate_and_print_output(
+        self,
+        before_embeddings: torch.Tensor,
+        after_embeddings: torch.Tensor,
+        optimized_embeddings: torch.Tensor,
+    ):
+        """
+        Generate and print the output of the model.
+        """
+        full_embeddings = torch.cat(
+            [before_embeddings, optimized_embeddings, after_embeddings], dim=1
+        )
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs_embeds=full_embeddings,
+                max_new_tokens=100,
+            )
+        print("=" * 100)
+        print(self.tokenizer.decode(outputs[0]))
+        print("=" * 100)
+
+    def initialize_optimized_embeddings(
+        self,
+    ) -> Tuple[torch.Tensor, torch.optim.Optimizer]:
+        """
+        Initialize the optimized embeddings.
+        """
+
+        embedding_layer = self.model.get_input_embeddings()
+        if self.optimization_init is None:
+            optimized_embeddings = torch.randn(
+                (1, self.num_tokens, self.model.config.hidden_size),
+                device=self.device,
+                dtype=self.model.dtype,
+            ).requires_grad_()
+        else:
+            optimized_tokens = self.tokenizer(
+                self.optimization_init,
+                return_tensors="pt",
+                add_special_tokens=False,
+            ).input_ids.to(self.device)
+            optimized_embeddings = (
+                embedding_layer(optimized_tokens).detach().clone().requires_grad_()
+            )
+        optimizer = torch.optim.Adam(
+            [optimized_embeddings], lr=self.learning_rate, eps=1e-6
+        )
+
+        return optimized_embeddings, optimizer
+
+    def optimize(self, dataset: TargetedDialogueDataset) -> AttackResult:
         """
         Optimize embedding tokens for the given dataset.
         Creates individual optimized embeddings for each example.
@@ -115,36 +235,48 @@ class EmbeddingAttack:
             dataset: Dataset containing prompt-target pairs
 
         Returns:
-            Dictionary mapping example indices to their optimized embeddings
+            AttackResult containing the optimized embeddings and losses
         """
         if len(dataset) == 0:
             raise ValueError("Dataset is empty")
 
+        if self.use_wandb:
+            wandb.init(project=self.wandb_project)
+
         embedding_layer = self.model.get_input_embeddings()
-        tokenized_prompts, tokenized_targets = self._prepare_dataset(dataset)
-
-        optimized_tokens = self.tokenizer(
-            self.optimization_init,
-            return_tensors="pt",
-            add_special_tokens=False,
-        ).input_ids.to(self.device)
-        optimized_embeddings = (
-            embedding_layer(optimized_tokens).detach().clone().requires_grad_()
-        )
-        optimizer = torch.optim.Adam(
-            [optimized_embeddings], lr=self.learning_rate, eps=1e-6
+        dataset_size = len(dataset)
+        tokenized_before, tokenized_after, tokenized_targets = self._prepare_dataset(
+            dataset
         )
 
+        if self.universal:
+            optimized_embeddings, optimizer = self.initialize_optimized_embeddings()
+
+        epoch_losses = []
+        optimized_embeddings_dict = {}
         for epoch in range(self.num_epochs):
-            for idx in tqdm(range(len(tokenized_prompts)), desc="Example"):
-                # Tokenize inputs
-                input_tokens = (
-                    tokenized_prompts.tokens[idx].to(self.device).unsqueeze(0)
+            example_losses = []
+            for idx in tqdm(range(dataset_size), desc="Example"):
+                if not self.universal:
+                    optimized_embeddings, optimizer = (
+                        self.initialize_optimized_embeddings()
+                    )
+
+                before_tokens = (
+                    tokenized_before.input_ids[idx].to(self.device).unsqueeze(0)
                 )
-                input_attention_mask = (
-                    tokenized_prompts.attention_mask[idx].to(self.device).unsqueeze(0)
+                before_attention_mask = (
+                    tokenized_before.attention_mask[idx].to(self.device).unsqueeze(0)
                 )
-                input_embeddings = embedding_layer(input_tokens)
+                before_embeddings = embedding_layer(before_tokens)
+
+                after_tokens = (
+                    tokenized_after.input_ids[idx].to(self.device).unsqueeze(0)
+                )
+                after_attention_mask = (
+                    tokenized_after.attention_mask[idx].to(self.device).unsqueeze(0)
+                )
+                after_embeddings = embedding_layer(after_tokens)
 
                 # Tokenize target
                 target = tokenized_targets.input_ids[idx].to(self.device).unsqueeze(0)
@@ -153,24 +285,25 @@ class EmbeddingAttack:
                 )
                 target_embeddings = embedding_layer(target)
 
-                losses = []
-                for _ in tqdm(range(self.num_iterations_per_example)):
+                for i in range(self.num_iterations_per_example):
                     optimizer.zero_grad()
 
                     combined_embeddings = torch.cat(
                         [
-                            input_embeddings.detach(),
+                            before_embeddings.detach(),
                             optimized_embeddings,
+                            after_embeddings.detach(),
                             target_embeddings.detach(),
                         ],
                         dim=1,
                     )
                     combined_attention_mask = torch.cat(
                         [
-                            input_attention_mask.detach(),
+                            before_attention_mask.detach(),
                             torch.ones(
-                                (1, optimized_tokens.shape[1]), device=self.device
+                                (1, optimized_embeddings.shape[1]), device=self.device
                             ),
+                            after_attention_mask.detach(),
                             target_attention_mask.detach(),
                         ],
                         dim=1,
@@ -184,131 +317,46 @@ class EmbeddingAttack:
                     logits = outputs.logits
 
                     # Shift logits so token n-1 predicts token n
-                    shift = combined_embeddings.shape[1] - target.shape[1]
-                    shift_logits = logits[..., shift - 1 : -1, :].contiguous()
+                    target_len = target.shape[1]
+                    shift_logits = logits[:, -target_len - 1 : -1, :]
                     shift_labels = target
 
                     loss = torch.nn.functional.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
+                        shift_logits.transpose(1, 2),
+                        shift_labels,
+                        ignore_index=self.tokenizer.pad_token_id,
                     )
                     loss_float = loss.item()
-                    losses.append(loss_float)
+                    logger.info(f"Example {idx}, Iteration {i:3d} | Loss: {loss_float}")
+                    example_losses.append(loss_float)
 
                     loss.backward()
                     optimizer.step()
 
-                logger.info(f"Epoch {epoch} Loss: {sum(losses) / len(losses)}")
+                epoch_losses.append(example_losses)
+                logger.info(f"Example {idx} | Loss: {example_losses[-1]}")
+                optimized_embeddings_dict[idx] = optimized_embeddings
+                self._generate_and_print_output(
+                    before_embeddings, after_embeddings, optimized_embeddings
+                )
+                if self.use_wandb:
+                    wandb.log(
+                        {"loss": example_losses[-1]}, step=idx + epoch * len(dataset)
+                    )
 
-        return None
-
-    # def optimize(self, dataset: TargetedDialogueDataset) -> list[float]:
-    #     """
-    #     Optimize embedding tokens for the given dataset.
-    #     Creates individual optimized embeddings for each example.
-
-    #     Args:
-    #         dataset: Dataset containing prompt-target pairs
-
-    #     Returns:
-    #         Dictionary mapping example indices to their optimized embeddings
-    #     """
-    #     if len(dataset) == 0:
-    #         raise ValueError("Dataset is empty")
-
-    #     embedding_layer = self.model.get_input_embeddings()
-
-    #     losses = []
-    #     for i, (dialogue, target) in enumerate(
-    #         zip(dataset.dialogues, dataset.target_completions)
-    #     ):
-    #         prompt_dialogue = []
-    #         for msg in dialogue:
-    #             if msg.role == "assistant" and msg is dialogue[-1]:
-    #                 # Skip the last assistant message as this is what we want to generate
-    #                 continue
-    #             prompt_dialogue.append(msg)
-
-    #         messages = preprocess_dialogue(prompt_dialogue)
-    #         print("=" * 100)
-    #         print(messages)
-    #         print(target)
-    #         print("=" * 100)
-
-    #         if not any(["{optim_str}" in d["content"] for d in messages]):
-    #             messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
-
-    #         template = self.tokenizer.apply_chat_template(
-    #             messages, tokenize=False, add_generation_prompt=True
-    #         )
-    #         # Remove the BOS token -- this will get added when tokenizing, if necessary
-    #         if self.tokenizer.bos_token and template.startswith(
-    #             self.tokenizer.bos_token
-    #         ):
-    #             template = template.replace(self.tokenizer.bos_token, "")
-    #         before_str, after_str = template.split("{optim_str}")
-
-    #         # Tokenize everything that doesn't get optimized
-    #         before_ids = self.tokenizer([before_str], padding=False)["input_ids"]
-    #         after_ids = self.tokenizer([after_str], add_special_tokens=False)[
-    #             "input_ids"
-    #         ]
-    #         target_ids = self.tokenizer([target], add_special_tokens=False)["input_ids"]
-
-    #         before_ids, after_ids, target_ids = [
-    #             torch.tensor(ids, device=self.device)
-    #             for ids in (before_ids, after_ids, target_ids)
-    #         ]
-
-    #         # Embed everything that doesn't get optimized
-    #         before_embeds, after_embeds, target_embeds = [
-    #             embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)
-    #         ]
-
-    #         # Compute the KV Cache for tokens that appear before the optimized tokens
-    #         with torch.no_grad():
-    #             output = self.model(inputs_embeds=before_embeds, use_cache=True)
-    #             prefix_cache = output.past_key_values
-
-    #         optim_ids = self.tokenizer(
-    #             self.optimization_init, return_tensors="pt", add_special_tokens=False
-    #         )["input_ids"].to(self.device)
-    #         optim_embeds = embedding_layer(optim_ids).detach().clone().requires_grad_()
-
-    #         optimizer = torch.optim.Adam(
-    #             [optim_embeds], lr=self.learning_rate, eps=1e-6
-    #         )
-
-    #         losses = []
-    #         for i in range(self.num_iterations_per_example):
-    #             optimizer.zero_grad()
-    #             input_embeds = torch.cat(
-    #                 [optim_embeds, after_embeds.detach(), target_embeds.detach()], dim=1
-    #             )
-
-    #             output = self.model(
-    #                 inputs_embeds=input_embeds,
-    #                 past_key_values=prefix_cache,
-    #                 output_hidden_states=True,
-    #             )
-    #             logits = output.logits
-
-    #             # Shift logits so token n-1 predicts token n
-    #             shift = input_embeds.shape[1] - target_ids.shape[1]
-    #             shift_logits = logits[
-    #                 ..., shift - 1 : -1, :
-    #             ].contiguous()  # (1, num_target_ids, vocab_size)
-    #             shift_labels = target_ids
-
-    #             loss = torch.nn.functional.cross_entropy(
-    #                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-    #             )
-    #             loss_float = loss.item()
-    #             losses.append(loss_float)
-
-    #             logger.info(f"Loss: {loss_float}")
-
-    #             loss.backward()
-    #             optimizer.step()
-
-    #     return losses
+        if self.universal:
+            # return last optimized embedding
+            return AttackResult(
+                optimized_embeddings=optimized_embeddings,
+                losses=epoch_losses,
+            )
+        else:
+            # sort optimized embeddings by example index and return list of tensors
+            optimized_embeddings_list = sorted(
+                optimized_embeddings_dict.items(), key=lambda x: x[0]
+            )
+            optimized_embeddings = [x[1] for x in optimized_embeddings_list]
+            return AttackResult(
+                optimized_embeddings=optimized_embeddings,
+                losses=epoch_losses,
+            )
