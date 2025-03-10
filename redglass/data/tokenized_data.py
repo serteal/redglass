@@ -182,7 +182,8 @@ class TokenizedDataset:
         cls,
         dialogues: list[Dialogue],
         tokenizer: PreTrainedTokenizerBase,
-        padding: dict[str, dict[str, int]],
+        detection_mask_padding: dict[str, dict[str, int]],
+        tokenizer_padding: bool = True,
         for_generation: bool = False,
         detect_all: bool = False,
         detect_only_start_of_turn: bool = False,
@@ -199,7 +200,7 @@ class TokenizedDataset:
         Args:
             dialogues (list[Dialogue]): List of dialogues to tokenize.
             tokenizer (PreTrainedTokenizerBase): Tokenizer to use for processing the text.
-            padding (dict[str, dict[str, int]]): Padding configuration for detection mask. Non-zero
+            detection_mask_padding (dict[str, dict[str, int]]): Padding configuration for detection mask. Non-zero
                 values will extend the detection mask to include tokens just before or after the
                 marked ones.
             for_generation (bool): Whether to have the tokens ready for generation.
@@ -264,7 +265,7 @@ class TokenizedDataset:
 
         tokenizer_out = tokenizer(
             formatted_dialogues,
-            padding=True,
+            padding=tokenizer_padding,
             return_tensors="pt",
             add_special_tokens=False,
             max_length=max_length,
@@ -279,7 +280,7 @@ class TokenizedDataset:
             formatted_dialogues,
             for_generation,
             detect_all,
-            padding[tokenizer_type],
+            detection_mask_padding[tokenizer_type],
             cast(ModelType, tokenizer_type),
         )
         if detection_mask is not None and detect_only_start_of_turn:
@@ -348,7 +349,7 @@ class TokenizedDataset:
         return cls.from_dialogue_list(
             dialogues=dataset.dialogues,
             tokenizer=tokenizer,
-            padding=dataset.padding,
+            detection_mask_padding=dataset.padding,
             for_generation=for_generation,
             detect_all=detect_all,
             detect_only_start_of_turn=detect_only_start_of_turn,

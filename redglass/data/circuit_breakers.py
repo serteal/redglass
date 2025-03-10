@@ -51,6 +51,7 @@ class CircuitBreakersDataset(TargetedDialogueDataset):
         for _, row in safe_raw_data.iterrows():
             dialogue: Dialogue = [
                 Message("user", cast(str, row["prompt"]).strip(), False),
+                Message("assistant", cast(str, row["response"]).strip(), True),
             ]
             all_dialogues.append(dialogue)
             all_labels.append(Label.SAFE)
@@ -59,6 +60,7 @@ class CircuitBreakersDataset(TargetedDialogueDataset):
         for _, row in unsafe_raw_data.iterrows():
             dialogue: Dialogue = [
                 Message("user", cast(str, row["prompt"]).strip(), False),
+                Message("assistant", cast(str, row["response"]).strip(), True),
             ]
             all_dialogues.append(dialogue)
             all_labels.append(Label.UNSAFE)

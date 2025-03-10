@@ -108,7 +108,6 @@ def get_gemma_model_and_tokenizer(
         device_map="auto",
         attn_implementation="eager",
         torch_dtype=dtype,
-        cache_dir=Path("/data/huggingface"),
         local_files_only=True,
     )
 
@@ -123,9 +122,17 @@ def get_gemma_model_and_tokenizer(
 
 @cache
 def get_llama3_tokenizer() -> PreTrainedTokenizerBase:
-    tokenizer_name = "meta-llama/Meta-Llama-3.1-70B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, padding_side="left")
-    tokenizer.pad_token_id = tokenizer.bos_token_id
+    tokenizer_name = "meta-llama/Llama-3.1-8B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token:
+        pass
+    elif tokenizer.unk_token:
+        tokenizer.pad_token_id = tokenizer.unk_token_id
+    elif tokenizer.eos_token:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    else:
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     return tokenizer
 
 
@@ -140,19 +147,19 @@ def get_llama3_model_and_tokenizer(
         return None, tokenizer
 
     model_path = {
-        ModelName.LLAMA_8B: "meta-llama/Meta-Llama-3.1-8B-Instruct",
-        ModelName.LLAMA_70B: "meta-llama/Meta-Llama-3.1-70B-Instruct",
+        ModelName.LLAMA_8B: "meta-llama/Llama-3.1-8B-Instruct",
+        ModelName.LLAMA_70B: "meta-llama/Llama-3.1-70B-Instruct",
         ModelName.LLAMA_70B_3_3: "meta-llama/Llama-3.3-70B-Instruct",
     }[model_name]
-    models_directory = Path("/data/huggingface")
 
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
         device_map="auto",
-        cache_dir=models_directory,
-        local_files_only=True,
     )
+    for param in model.parameters():
+        param.requires_grad = False
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     model.eval()
 
     return model, tokenizer

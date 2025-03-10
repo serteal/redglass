@@ -500,10 +500,12 @@ class TargetedDialogueDataset:
             )
             dialogues, labels, metadata, target_completions = self._get_dialogues()
         assert labels is not None
+        assert target_completions is not None
 
         self.dialogues = dialogues
         self.labels = labels
         self.metadata = metadata
+        self.target_completions = target_completions
         if model is not None:
             self.model = model
 
@@ -597,6 +599,7 @@ class TargetedDialogueDataset:
         self.labels = [self.labels[i] for i in perm]
         if self.metadata is not None:
             self.metadata = {k: [v[i] for i in perm] for k, v in self.metadata.items()}
+        self.target_completions = [self.target_completions[i] for i in perm]
 
     def split_dialogues_on_reasoning(self, trim_reasoning: str) -> None:
         for i, dialogue in enumerate(self.dialogues):
