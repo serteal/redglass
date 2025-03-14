@@ -10,8 +10,9 @@ from tqdm.auto import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 import wandb
-from redglass.data import TargetedDialogueDataset
-from redglass.data.tokenized_data import TokenizedDataset
+from redglass.activations import Activations
+from redglass.data import TargetedDialogueDataset, TokenizedDataset
+from redglass.detectors import DirectionDetector
 from redglass.log import logger
 from redglass.types import Dialogue
 from redglass.utils import preprocess_dialogue
@@ -60,6 +61,9 @@ class EmbeddingAttack:
         num_epochs: int = 1,
         use_wandb: bool = False,
         wandb_project: Optional[str] = None,
+        detectors: list[DirectionDetector] = [],
+        detector_loss_weight: float = 0.1,
+        verbose: bool = False,
     ):
         """
         Initialize the embedding attack.
@@ -78,6 +82,9 @@ class EmbeddingAttack:
             num_epochs: Number of epochs to run the optimization for.
             use_wandb: Whether to use Weights & Biases for logging
             wandb_project: The name of the Weights & Biases project
+            detectors: List of detectors to use for detection
+            detector_loss_weight: Weight for the detector loss
+            verbose: Whether to print verbose output
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -98,6 +105,12 @@ class EmbeddingAttack:
         self.wandb_project = wandb_project
 
         self.optim_token = "<|optim-loc|>"
+        self.optimized_embeddings = None  # filled after optimize() is called
+
+        self.detectors = detectors
+        self.detector_loss_weight = detector_loss_weight
+
+        self.verbose = verbose
 
     def _prepare_dataset(
         self, dataset: TargetedDialogueDataset
@@ -204,6 +217,7 @@ class EmbeddingAttack:
         Initialize the optimized embeddings.
         """
 
+        logger.debug("Initializing new optimized embeddings")
         embedding_layer = self.model.get_input_embeddings()
         if self.optimization_init is None:
             optimized_embeddings = torch.randn(
@@ -285,6 +299,9 @@ class EmbeddingAttack:
                 )
                 target_embeddings = embedding_layer(target)
 
+                if self.verbose:
+                    self._print_input_and_target(before_tokens, after_tokens, target)
+
                 for i in range(self.num_iterations_per_example):
                     optimizer.zero_grad()
 
@@ -321,31 +338,77 @@ class EmbeddingAttack:
                     shift_logits = logits[:, -target_len - 1 : -1, :]
                     shift_labels = target
 
-                    loss = torch.nn.functional.cross_entropy(
+                    ce_loss = torch.nn.functional.cross_entropy(
                         shift_logits.transpose(1, 2),
                         shift_labels,
                         ignore_index=self.tokenizer.pad_token_id,
                     )
+
+                    if self.detectors is not None:
+                        tokenized_dataset = TokenizedDataset(
+                            dialogues=[],
+                            formatted_dialogues=[],
+                            str_tokens=[],
+                            tokens=torch.zeros_like(combined_attention_mask).int(),
+                            attention_mask=combined_attention_mask.bool(),
+                            detection_mask=combined_attention_mask.int(),
+                        )
+                        hidden_states = outputs.hidden_states
+
+                        detector_losses = []
+                        for detector in self.detectors:
+                            detector_layers = detector.layers
+                            all_acts = torch.stack(
+                                [
+                                    hidden_states[layer_idx]
+                                    for layer_idx in detector_layers
+                                ],
+                                dim=2,
+                            )
+                            activations = Activations(
+                                all_acts=all_acts,
+                                tokenized_dataset=tokenized_dataset,
+                                layers=detector_layers,
+                            )
+                            scores = detector.score(activations, all_acts=True)
+                            detector_losses.append(
+                                torch.cat([s for s in scores.scores])
+                            )
+
+                        detector_loss = torch.mean(torch.stack(detector_losses))
+
+                    loss = (
+                        ce_loss + self.detector_loss_weight * detector_loss
+                        if self.detectors
+                        else ce_loss
+                    )
+                    ce_loss_float = ce_loss.item()
+                    detector_loss_float = (
+                        detector_loss.item() if self.detectors else 0.0
+                    )
                     loss_float = loss.item()
-                    logger.info(f"Example {idx}, Iteration {i:3d} | Loss: {loss_float}")
+                    if self.verbose:
+                        logger.info(
+                            f"Example {idx}, Iteration {i:3d} | CE: {ce_loss_float:.4f} | Detector: {detector_loss_float:.4f}"
+                        )
                     example_losses.append(loss_float)
 
                     loss.backward()
                     optimizer.step()
 
                 epoch_losses.append(example_losses)
-                logger.info(f"Example {idx} | Loss: {example_losses[-1]}")
+                logger.debug(f"Example {idx} | Loss: {example_losses[-1]}")
                 optimized_embeddings_dict[idx] = optimized_embeddings
-                self._generate_and_print_output(
-                    before_embeddings, after_embeddings, optimized_embeddings
-                )
-                if self.use_wandb:
-                    wandb.log(
-                        {"loss": example_losses[-1]}, step=idx + epoch * len(dataset)
+                if self.verbose:
+                    self._generate_and_print_output(
+                        before_embeddings, after_embeddings, optimized_embeddings
                     )
+                if self.use_wandb:
+                    wandb.log({"loss": example_losses[-1]})
 
         if self.universal:
             # return last optimized embedding
+            self.optimized_embeddings = optimized_embeddings
             return AttackResult(
                 optimized_embeddings=optimized_embeddings,
                 losses=epoch_losses,
@@ -360,3 +423,16 @@ class EmbeddingAttack:
                 optimized_embeddings=optimized_embeddings,
                 losses=epoch_losses,
             )
+
+    def generate_with_optimized_embeddings(
+        self, dataset: TargetedDialogueDataset
+    ) -> list[str]:
+        """
+        Generate completions with the optimized embeddings.
+        """
+        if self.optimized_embeddings is None:
+            raise ValueError(
+                "Optimized embeddings not found. Please run optimize() with universal=True first."
+            )
+
+        pass

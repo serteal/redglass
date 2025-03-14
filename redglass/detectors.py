@@ -148,6 +148,7 @@ class DirectionDetector(Detector):
     ) -> Float[Tensor, " toks"]:
         """Multiply the activations by the directions"""
         assert self.directions is not None
+        assert self.directions.ndim == 2
         if acts_tensor.is_sparse:
             assert acts_tensor.shape[1] == 1, (
                 "Sparse activations only supported for single layer"
